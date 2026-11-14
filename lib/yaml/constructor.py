@@ -5,16 +5,87 @@ __all__ = [
     'FullConstructor',
     'UnsafeConstructor',
     'Constructor',
-    'ConstructorError'
+    'ConstructorError',
+    'TimestampError',
+    'TimestampFormatError',
+    'TimestampOutOfRangeError'
 ]
 
 from .error import *
 from .nodes import *
 
-import collections.abc, datetime, base64, binascii, re, sys, types
+import collections.abc, datetime, base64, binascii, calendar, re, sys, types
 
 class ConstructorError(MarkedYAMLError):
     pass
+
+class TimestampError(ConstructorError):
+    """Base class for every failure while constructing a timestamp scalar.
+
+    Timestamp construction reports problems through the regular marked
+    constructor error contract, so ``except YAMLError`` (or
+    ``except ConstructorError``) handles them like any other YAML error and
+    ``problem_mark`` points at the offending scalar.
+
+    ``field`` identifies the timestamp component that caused the failure
+    (``year``, ``month``, ``day``, ``hour``, ``minute``, ``second``,
+    ``utc_offset`` or ``format``), making the error category distinguishable
+    by the out-of-range dimension.  ``value`` is the offending value.
+
+    Rationale for not falling back to the raw string: a timestamp resolved
+    implicitly (plain scalar) or tagged ``!!timestamp`` explicitly is
+    requested as a timestamp.  Silently returning the original text would
+    hand downstream code a ``str`` where it expects ``date``/``datetime`` --
+    the same class of failure, only deferred and harder to attribute.  It
+    would also make implicit and explicit tags disagree about types.  Failing
+    loudly with the mark keeps a bad config a load-time error that the
+    generic ``except YAMLError`` handling already catches.
+    """
+
+    field = None
+    value = None
+
+    def __init__(self, problem, mark, field=None, value=None):
+        super().__init__("while constructing a timestamp", mark, problem, mark)
+        if field is not None:
+            self.field = field
+        self.value = value
+
+class TimestampFormatError(TimestampError):
+    """The scalar does not match the YAML timestamp grammar at all."""
+
+    def __init__(self, value, mark):
+        super().__init__("expected a valid timestamp, but found %r" % (value,),
+                         mark, field='format', value=value)
+
+class TimestampOutOfRangeError(TimestampError):
+    """A timestamp component is syntactically valid but out of range."""
+
+    def __init__(self, field, value, expected, mark, label=None):
+        label = label or field.replace('_', ' ')
+        problem = "%s %r is out of range for a timestamp (expected %s)"  \
+                % (label, value, expected)
+        super().__init__(problem, mark, field=field, value=value)
+        self.expected = expected
+
+def _check_timestamp_range(field, value, minimum, maximum, mark,
+        label=None, expected=None):
+    if not minimum <= value <= maximum:
+        if expected is None:
+            expected = "%s..%s" % (minimum, maximum)
+        raise TimestampOutOfRangeError(field, value, expected, mark, label=label)
+
+# Fractional seconds are stored in datetime's microsecond resolution.  The
+# explicit contract is: keep the first six digits (truncate, never round) and
+# pad shorter fractions with zeros on the right.  Truncating toward zero can
+# only understate precision and keeps valid ISO 8601 / YAML 1.1 timestamps
+# loadable instead of turning them into errors.
+TIMESTAMP_MAX_FRACTION_DIGITS = 6
+
+def _construct_timestamp_fraction(fraction):
+    fraction = fraction[:TIMESTAMP_MAX_FRACTION_DIGITS]
+    fraction += '0' * (TIMESTAMP_MAX_FRACTION_DIGITS - len(fraction))
+    return int(fraction)
 
 class BaseConstructor:
 
@@ -324,32 +395,56 @@ class SafeConstructor(BaseConstructor):
 
     def construct_yaml_timestamp(self, node):
         value = self.construct_scalar(node)
-        match = self.timestamp_regexp.match(node.value)
+        match = self.timestamp_regexp.match(value)
+        if match is None:
+            raise TimestampFormatError(value, node.start_mark)
         values = match.groupdict()
+        mark = node.start_mark
+        # Date component: both the date-only path and the full datetime path
+        # validate here, so out-of-range values never reach datetime.date or
+        # datetime.datetime as a bare ValueError.
         year = int(values['year'])
         month = int(values['month'])
         day = int(values['day'])
+        _check_timestamp_range('year', year,
+                datetime.MINYEAR, datetime.MAXYEAR, mark)
+        _check_timestamp_range('month', month, 1, 12, mark)
+        days_in_month = calendar.monthrange(year, month)[1]
+        _check_timestamp_range('day', day, 1, days_in_month, mark,
+                expected="1..%d (month %04d-%02d)" % (days_in_month, year, month))
         if not values['hour']:
+            # Date-only construction path.
             return datetime.date(year, month, day)
         hour = int(values['hour'])
         minute = int(values['minute'])
         second = int(values['second'])
+        _check_timestamp_range('hour', hour, 0, 23, mark)
+        _check_timestamp_range('minute', minute, 0, 59, mark)
+        _check_timestamp_range('second', second, 0, 59, mark)
         fraction = 0
         tzinfo = None
         if values['fraction']:
-            fraction = values['fraction'][:6]
-            while len(fraction) < 6:
-                fraction += '0'
-            fraction = int(fraction)
+            # Fractional-second path: truncate to microseconds explicitly.
+            fraction = _construct_timestamp_fraction(values['fraction'])
         if values['tz_sign']:
+            # UTC offset construction path.
             tz_hour = int(values['tz_hour'])
             tz_minute = int(values['tz_minute'] or 0)
+            offset_text = "%s%d:%02d" % (values['tz_sign'], tz_hour, tz_minute)
+            # datetime.timezone rejects offsets of exactly 24:00, while
+            # timedelta would otherwise silently normalize e.g. +5:99 into
+            # a different (but in-range) offset, so validate explicitly.
+            if tz_hour > 23 or tz_minute > 59 or tz_hour * 60 + tz_minute >= 24 * 60:
+                raise TimestampOutOfRangeError('utc_offset', offset_text,
+                        'strictly between -24:00 and +24:00', mark,
+                        label='UTC offset')
             delta = datetime.timedelta(hours=tz_hour, minutes=tz_minute)
             if values['tz_sign'] == '-':
                 delta = -delta
             tzinfo = datetime.timezone(delta)
         elif values['tz']:
             tzinfo = datetime.timezone.utc
+        # Naive/aware datetime construction path.
         return datetime.datetime(year, month, day, hour, minute, second, fraction,
                                  tzinfo=tzinfo)
 

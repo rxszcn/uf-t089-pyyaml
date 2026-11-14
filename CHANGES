@@ -5,7 +5,14 @@ For a complete changelog, see:
 
 7.0.0.dev0 (TBD)
 
-* TBD
+* Timestamp construction now reports failures through `ConstructorError`
+  (a `MarkedYAMLError`) instead of leaking bare `ValueError`/`AttributeError`.
+  Out-of-range components raise `TimestampOutOfRangeError` with a
+  `field` attribute (`year`, `month`, `day`, `hour`, `minute`, `second`,
+  `utc_offset`) and malformed scalars reached via `!!timestamp` raise
+  `TimestampFormatError`; both carry the source mark of the scalar.
+* Fractional seconds are explicitly truncated to six digits (never rounded)
+  to match datetime's microsecond resolution.
 
 6.0.2 (2024-08-06)
 
